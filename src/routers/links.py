@@ -2,8 +2,11 @@ import datetime as dt
 import string
 import random
 import typing as tp
-from fastapi import HTTPException, APIRouter, Query, Depends
+from fastapi import HTTPException, APIRouter, Query, Depends, status, Body
 from fastapi.responses import RedirectResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+import jwt
+import hashlib
 from pydantic import HttpUrl
 from sqlalchemy.ext.asyncio import AsyncSession
 import sqlalchemy as sa
@@ -11,9 +14,97 @@ from src.db_sqlite.engine import get_async_session
 from src.redis_.engine import get_redis_client
 
 ALIAS_LENGTH = 10
+SECRET_KEY = "SECRET_KEY"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 10
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/token")
 
 router = APIRouter(prefix='/links', tags=['Links'])
 
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_password(plain_password: str, hashed: str) -> bool:
+    return hash_password(plain_password) == hashed
+
+def create_access_token(data: dict, expires_delta: dt.timedelta | None = None) -> str:
+    to_encode = data.copy()
+    expire = dt.datetime.now() + (expires_delta or dt.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode["exp"] = expire
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    session: AsyncSession = Depends(get_async_session)
+) -> tp.Dict[str, str]:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_email: str = payload.get("sub")
+        if user_email is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Неверные учетные данные")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Неверные учетные данные")
+
+    query = sa.text(
+        """
+        select * from users where email = :email
+        """
+    )
+    result = await session.execute(query, params={'email': user_email})
+    user = result.fetchone()
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Пользователь не найден")
+
+    return {"id": user.id, "email": user.email}
+
+
+@router.post("/register", summary="Регистрация нового пользователя")
+async def register(
+        email: str,
+        password: str,
+        session: AsyncSession = Depends(get_async_session)
+):
+    query = sa.text(
+        """
+        select * from users where email = :email
+        """
+    )
+    result = await session.execute(query, params={'email': email})
+
+    if result.fetchone():
+        raise HTTPException(status_code=400, detail="Пользователь с таким email уже зарегистрирован")
+
+    stmt = sa.text("""
+            INSERT INTO users (email, password_hash)
+            VALUES (:email, :password_hash)
+        """)
+
+    await session.execute(stmt, params={'email': email, "password_hash": hash_password(password)})
+    await session.commit()
+    return {"msg": "Пользователь успешно зарегистрирован"}
+
+
+@router.post("/token", summary="Получение JWT токена")
+async def login(
+        form_data: OAuth2PasswordRequestForm = Depends(),
+        session: AsyncSession = Depends(get_async_session)
+):
+    query = sa.text(
+        """
+        select * from users where email = :email
+        """
+    )
+    result = await session.execute(query, params={'email': form_data.username})
+
+    user = result.fetchone()
+    if not user or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Неверный email или пароль")
+
+    token = create_access_token(data={"sub": user.email})
+    return {"access_token": token, "token_type": "bearer"}
 
 async def alias_exists(alias: str, session: AsyncSession) -> bool:
     result = await session.execute(
@@ -30,7 +121,17 @@ async def shorten_link(
         redis_client=Depends(get_redis_client),
         custom_alias: str | None = None,
         expires_at: dt.datetime | None = None,
+        token: tp.Optional[str] = Depends(oauth2_scheme)
 ) -> tp.Dict[str, str]:
+
+    user_id = None
+    if token:
+        try:
+            current_user = await get_current_user(token, session)
+            user_id = current_user["id"]
+        except HTTPException:
+            user_id = None
+
     if custom_alias is not None:
         if await alias_exists(custom_alias, session):
             raise HTTPException(status_code=400, detail="Алиас уже занят. Выберите другое значение.")
@@ -50,12 +151,13 @@ async def shorten_link(
     try:
         await session.execute(
             sa.text("""
-                    INSERT INTO links (original_url, custom_alias, expires_at)
-                    VALUES (:original_url, :alias, :expires_at)
+                    INSERT INTO links (original_url, custom_alias, expires_at, user_id)
+                    VALUES (:original_url, :alias, :expires_at, :user_id)
                 """),
             {"original_url": str(url),
              "alias": alias,
-             "expires_at": expires_at}
+             "expires_at": expires_at,
+             "user_id": user_id,}
         )
         await session.commit()
     except Exception as exc:
@@ -126,14 +228,20 @@ async def delete_link(
     alias: str,
     session: AsyncSession = Depends(get_async_session),
     redis_client=Depends(get_redis_client),
+    current_user: tp.Dict[str, str] = Depends(get_current_user)
 ) -> tp.Dict[str, str]:
     result = await session.execute(
-        sa.text("SELECT id FROM links WHERE custom_alias = :alias"),
+        sa.text("SELECT id, user_id FROM links WHERE custom_alias = :alias"),
         {"alias": alias}
     )
     row = result.fetchone()
+
     if row is None:
         raise HTTPException(status_code=404, detail="Ссылка с данным алиасом не найдена.")
+
+    row_data = dict(row._mapping)
+    if row_data['user_id'] != current_user.get("id"):
+        raise HTTPException(status_code=403, detail="Вы не можете удалять чужую ссылку")
 
     try:
         await session.execute(
@@ -159,6 +267,7 @@ async def update_link(
     update_link_url: HttpUrl,
     session: AsyncSession = Depends(get_async_session),
     redis_client=Depends(get_redis_client),
+    current_user: tp.Dict[str, str] = Depends(get_current_user),
 ) -> tp.Dict[str, str]:
 
     query = sa.text("SELECT id FROM links WHERE custom_alias = :alias")
@@ -166,6 +275,10 @@ async def update_link(
     row = result.fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="Ссылка с данным алиасом не найдена.")
+
+    row_data = dict(row._mapping)
+    if row_data['user_id'] != current_user.get("id"):
+        raise HTTPException(status_code=403, detail="Вы не можете изменять чужую ссылку")
 
     try:
         await session.execute(

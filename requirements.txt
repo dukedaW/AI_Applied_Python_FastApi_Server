@@ -1,10 +1,13 @@
 alembic~=1.14.1
+asyncpg
+aiosqlite
 fastapi~=0.115.8
 psycopg2-binary
 python-dotenv~=1.0.1
 sqlalchemy~=2.0.37
 fastapi-users[sqlalchemy]
 fastapi[all]
+PyJWT
 uvicorn~=0.34.0
 asyncpg
 fastapi-cache2[redis]
