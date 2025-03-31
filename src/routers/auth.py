@@ -22,7 +22,7 @@ async def register(
         email: str,
         password: str,
         session: AsyncSession = Depends(get_async_session)
-):
+) -> tp.Dict[str, str]:
 
     query = sa.text("SELECT * FROM users WHERE email = :email")
     result = await session.execute(query, params={'email': email})
