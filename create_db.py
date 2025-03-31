@@ -35,5 +35,5 @@ def create_database(db_name="links.db"):
     conn.close()
     print(f"Database '{db_name}' created with the required schema.")
 
-if __name__ == '__main__':
-    create_database()
+# if __name__ == '__main__':
+#     create_database()

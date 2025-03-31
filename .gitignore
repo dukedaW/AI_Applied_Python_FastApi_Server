@@ -28,7 +28,7 @@ var/
 *.spec
 
 *.db
-*.rbd
+*.rdb
 
 # Installer logs
 pip-log.txt
