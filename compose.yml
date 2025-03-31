@@ -10,6 +10,8 @@ services:
       - .:/app
     depends_on:
       - redis
+    environment:
+      DB_URL: ${DB_URL}
 
   redis:
     image: redis:latest
